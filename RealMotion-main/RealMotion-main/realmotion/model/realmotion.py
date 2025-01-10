@@ -335,15 +335,25 @@ class RealMotion(RealMotion_I):
 
     def forward(self, data):
         # 更新记忆库
-        memory_dict = self.update_memory(data, data['x_encoder'], data['key_valid_mask'], data['x_type_mask'])
+        if 'x_encoder' in data:
+            # 如果 x_encoder 已经在 data 中，则更新记忆库
+            memory_dict = self.update_memory(data, data['x_encoder'], data['key_valid_mask'], data['x_type_mask'])
+        else:
+            # 如果 x_encoder 不在 data 中，暂时跳过更新
+            memory_dict = None  # 或者保留原有的 memory_dict
 
         # 进行进一步的处理，使用memory_dict中的共享记忆...
         
-        ret_dict = {
-            'y_hat': data['y_hat'],
-            'pi': data['pi'],
-            'y_hat_others': data['y_hat_others'],
-        }
+        if 'y_hat' in data and 'pi' in data and 'y_hat_others' in data:
+            ret_dict = {
+                'y_hat': data['y_hat'],
+                'pi': data['pi'],
+                'y_hat_others': data['y_hat_others'],
+                    }
+        else:
+            # 可能需要先进行其他处理，或者给默认值
+            ret_dict = {}
+
 
         # 将更新后的共享记忆库返回
         ret_dict['memory_dict'] = memory_dict
