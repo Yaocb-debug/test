@@ -85,7 +85,7 @@ class RealMotion_I(nn.Module):
         return self.load_state_dict(state_dict=state_dict, strict=False)
 
     def forward(self, data):
-        hist_valid_mask = data['x_valid_mask']
+        hist_valid_mask = data['x_valid_mask']          
         hist_key_valid_mask = data['x_key_valid_mask']
         hist_feat = torch.cat(
             [
@@ -223,16 +223,21 @@ class RealMotion_I(nn.Module):
 
         return ret_dict
 
+
 class RealMotion(RealMotion_I):
     def __init__(self, 
+                 max_memory_size=5,  # 最大记忆库大小
+                 adapt_memory_size=True,  # 是否启用自适应记忆大小
                  use_stream_encoder=True,
                  use_stream_decoder=True,
                  **kwargs):
         super().__init__(**kwargs)
-        self.use_stream_encoder = use_stream_encoder
-        self.use_stream_decoder = use_stream_decoder
+        self.max_memory_size = max_memory_size  # 最大智能体记忆库大小
+        self.adapt_memory_size = adapt_memory_size  # 是否启用自适应记忆大小
         self.embed_dim = kwargs['embed_dim']
         self.pose_dim = 4
+        
+        # 初始化其他组件...
         self.scene_interact = InteractionModule(
             dim=kwargs['embed_dim'],
             pose_dim=self.pose_dim,
@@ -248,7 +253,8 @@ class RealMotion(RealMotion_I):
             mlp_ratio=kwargs['mlp_ratio'],
             qkv_bias=kwargs['qkv_bias'],
         )
-
+         
+    
         self.stream_loc = nn.Sequential(
             nn.Linear(kwargs['embed_dim'], 256),
             nn.ReLU(),
@@ -261,4 +267,87 @@ class RealMotion(RealMotion_I):
             nn.GELU(),
             nn.Linear(kwargs['embed_dim'], kwargs['embed_dim']),
         )
+
+    def update_memory(self, data, x_encoder, key_valid_mask, x_type_mask):
+        """
+        更新记忆库，限制共享记忆库的大小，并动态选择重要智能体。
+        """
+        memory_dict = {
+            'x_encoder': x_encoder,
+            'x_mode': data['x_mode'],  # 当前智能体的模式
+            'glo_y_hat': data['glo_y_hat'],  # 当前智能体的预测轨迹
+            'x_mask': key_valid_mask,
+            'x_type_mask': x_type_mask,
+            'origin': data['origin'],
+            'theta': data['theta'],
+            'timestamp': data['timestamp'],
+        }
+
+        # 计算每个智能体与当前智能体的相似度（例如，基于位置、速度等）
+        if self.adapt_memory_size:
+            memory_dict = self.adaptive_memory_size(data, memory_dict)
+        
+        # 限制记忆库的大小，使用FIFO策略
+        if len(memory_dict['x_encoder']) > self.max_memory_size:
+            memory_dict = self.apply_fifo(memory_dict)
+        
+        return memory_dict
+
+    def apply_fifo(self, memory_dict):
+        """
+        应用FIFO策略，限制记忆库的大小，保留最新的max_memory_size个智能体。
+        """
+        memory_dict['x_encoder'] = memory_dict['x_encoder'][-self.max_memory_size:]  # 保留最近的max_memory_size个智能体
+        memory_dict['x_mode'] = memory_dict['x_mode'][-self.max_memory_size:]
+        memory_dict['glo_y_hat'] = memory_dict['glo_y_hat'][-self.max_memory_size:]
+        memory_dict['x_mask'] = memory_dict['x_mask'][-self.max_memory_size:]
+        memory_dict['x_type_mask'] = memory_dict['x_type_mask'][-self.max_memory_size:]
+        memory_dict['origin'] = memory_dict['origin'][-self.max_memory_size:]
+        memory_dict['theta'] = memory_dict['theta'][-self.max_memory_size:]
+        memory_dict['timestamp'] = memory_dict['timestamp'][-self.max_memory_size:]
+        return memory_dict
+
+    def adaptive_memory_size(self, data, memory_dict):
+        """
+        基于场景复杂度或智能体的密度来动态调整记忆库的大小。
+        """
+        # 这里假设场景的复杂度与当前智能体的数量成正比
+        num_agents = data['num_agents']  # 当前场景中的智能体数量
+    
+        # 根据场景复杂度动态调整最大记忆库大小
+        # 如果智能体数量较多，增加记忆库大小；反之，减少记忆库大小
+        if num_agents > 5:  # 如果智能体数量较多
+          self.max_memory_size = min(self.max_memory_size + 2, 5)  # 增加记忆库大小，但不超过 max_memory_size
+
+        elif num_agents < 2:  # 如果智能体数量较少
+          self.max_memory_size = max(self.max_memory_size - 1, 2)  # 减少记忆库大小，但保持至少有 2 个记忆库容量
+        
+        return memory_dict
+
+    def retrieve_memory(self, data, memory_dict):
+        """
+        从记忆库中检索当前智能体的共享记忆。
+        """
+        memory_x_encoder = memory_dict['x_encoder']
+        memory_valid_mask = memory_dict['x_mask']
+        memory_type_mask = memory_dict['x_type_mask']
+        return memory_x_encoder, memory_valid_mask, memory_type_mask
+
+    def forward(self, data):
+        # 更新记忆库
+        memory_dict = self.update_memory(data, data['x_encoder'], data['key_valid_mask'], data['x_type_mask'])
+
+        # 进行进一步的处理，使用memory_dict中的共享记忆...
+        
+        ret_dict = {
+            'y_hat': data['y_hat'],
+            'pi': data['pi'],
+            'y_hat_others': data['y_hat_others'],
+        }
+
+        # 将更新后的共享记忆库返回
+        ret_dict['memory_dict'] = memory_dict
+
+        return ret_dict
+
         
