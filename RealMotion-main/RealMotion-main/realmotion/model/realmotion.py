@@ -85,6 +85,14 @@ class RealMotion_I(nn.Module):
         return self.load_state_dict(state_dict=state_dict, strict=False)
 
     def forward(self, data):
+        # 更新记忆库
+        if 'x_encoder' in data:
+            # 如果 x_encoder 已经在 data 中，则更新记忆库
+            memory_dict = self.update_memory(data, data['x_encoder'], data['key_valid_mask'], data['x_type_mask'])
+        else:
+            # 如果 x_encoder 不在 data 中，暂时跳过更新
+            memory_dict = None  # 或者保留原有的 memory_dict
+
         hist_valid_mask = data['x_valid_mask']          
         hist_key_valid_mask = data['x_key_valid_mask']
         hist_feat = torch.cat(
@@ -155,8 +163,15 @@ class RealMotion_I(nn.Module):
                 memory_type_mask = x_type_mask
             cur_pose = torch.zeros_like(memory_pose)
 
+            # 场景交互，处理所有智能体的特征
             # scene interaction
-            new_x_encoder = x_encoder
+            new_x_encoder = self.scene_interact(
+                x_encoder, 
+                memory_x_encoder, 
+                cur_pose, 
+                memory_pose, 
+                key_padding_mask=~memory_valid_mask
+            )
             C = x_encoder.size(-1)
             # new_x_encoder = self.scene_interact(new_x_encoder, memory_x_encoder, cur_pose, memory_pose, key_padding_mask=~memory_valid_mask)
             new_actor_feat = self.scene_interact(new_x_encoder[x_type_mask].reshape(B, -1, C), memory_x_encoder, cur_pose, memory_pose, key_padding_mask=~memory_valid_mask)
@@ -168,11 +183,12 @@ class RealMotion_I(nn.Module):
             x_encoder = blk(x_encoder, key_padding_mask=~key_valid_mask)
         x_encoder = self.norm(x_encoder)
 
-        x_agent = x_encoder[:, 0]
+        # 修改: 在预测之前，确保使用交互后的特征
+        x_agent = new_actor_feat[:, 0]
         y_hat, pi, x_mode = self.decoder(x_agent)
-        x_others = x_encoder[:, 1:N]
+        x_others = new_actor_feat[:, 1:]
         y_hat_others = self.dense_predictor(x_others).view(B, x_others.size(1), -1, 2)
-        
+
         cos, sin = data['theta'].cos(), data['theta'].sin()
         rot_mat = data['theta'].new_zeros(B, 2, 2)
         rot_mat[:, 0, 0] = cos
@@ -203,6 +219,7 @@ class RealMotion_I(nn.Module):
             'y_hat': y_hat,
             'pi': pi,
             'y_hat_others': y_hat_others,
+            'x_mode': x_mode,  # 添加x_mode到返回字典
         }
 
         glo_y_hat = torch.bmm(y_hat.detach().reshape(B, -1, 2), torch.inverse(rot_mat))
@@ -333,31 +350,6 @@ class RealMotion(RealMotion_I):
         memory_type_mask = memory_dict['x_type_mask']
         return memory_x_encoder, memory_valid_mask, memory_type_mask
 
-    def forward(self, data):
-        # 更新记忆库
-        if 'x_encoder' in data:
-            # 如果 x_encoder 已经在 data 中，则更新记忆库
-            memory_dict = self.update_memory(data, data['x_encoder'], data['key_valid_mask'], data['x_type_mask'])
-        else:
-            # 如果 x_encoder 不在 data 中，暂时跳过更新
-            memory_dict = None  # 或者保留原有的 memory_dict
-
-        # 进行进一步的处理，使用memory_dict中的共享记忆...
-        
-        if 'y_hat' in data and 'pi' in data and 'y_hat_others' in data:
-            ret_dict = {
-                'y_hat': data['y_hat'],
-                'pi': data['pi'],
-                'y_hat_others': data['y_hat_others'],
-                    }
-        else:
-            # 可能需要先进行其他处理，或者给默认值
-            ret_dict = {}
-
-
-        # 将更新后的共享记忆库返回
-        ret_dict['memory_dict'] = memory_dict
-
-        return ret_dict
+    
 
         
