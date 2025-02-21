@@ -61,7 +61,6 @@ class BaseLightningModule(pl.LightningModule):
         others_reg_loss = F.smooth_l1_loss(
             y_hat_others[others_reg_mask], y_others[others_reg_mask]
         )
-
         loss = agent_reg_loss + agent_cls_loss + others_reg_loss + new_agent_reg_loss
         disp_dict = {
             f'{tag}loss': loss.item(),

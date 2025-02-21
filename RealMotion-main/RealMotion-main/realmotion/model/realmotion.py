@@ -23,9 +23,11 @@ class RealMotion_I(nn.Module):
         future_steps=60,
         use_transformer_decoder=False,
         num_decoder_layers=6,
+        closest_agents_num=3,
     ) -> None:
         super().__init__()
         self.use_transformer_decoder = use_transformer_decoder
+        self.closest_agents_num=closest_agents_num # 初始化 closest_agents_num
         self.hist_embed = AgentEmbeddingLayer(
             4, embed_dim // 4, drop_path_rate=drop_path
         )
@@ -84,15 +86,40 @@ class RealMotion_I(nn.Module):
         }
         return self.load_state_dict(state_dict=state_dict, strict=False)
 
-    def forward(self, data):
-        # 更新记忆库
-        if 'x_encoder' in data:
-            # 如果 x_encoder 已经在 data 中，则更新记忆库
-            memory_dict = self.update_memory(data, data['x_encoder'], data['key_valid_mask'], data['x_type_mask'])
-        else:
-            # 如果 x_encoder 不在 data 中，暂时跳过更新
-            memory_dict = None  # 或者保留原有的 memory_dict
+    def select_closest_agents(self, x_encoder_agents: torch.Tensor) -> torch.Tensor:
+        """
+        选择距离中心智能体最近的N个智能体，并返回其索引。
 
+        参数:
+            x_encoder (Tensor): 输入的智能体特征矩阵，形状为 (B, num_agents, feature_dim)。
+
+        返回:
+            Tuple[Tensor, Tensor]: 
+                - 最近的 N 个智能体的特征矩阵，形状为 (B, N, feature_dim)。
+                - 最近 N 个智能体的索引，形状为 (B, N)。
+        """
+        # 获取 B, num_agents, feature_dim 的维度
+        B, num_agents, feature_dim = x_encoder_agents.shape
+
+        # 假设中心智能体的特征是 x_encoder[:, 0]，即每个批次中的第一个智能体
+        center_agent = x_encoder_agents[:, 0, :]
+
+        # 计算每个智能体到中心智能体的欧式距离
+        distances = torch.norm(x_encoder_agents[:, 1:, :] - center_agent[:, None, :], dim=-1)  # (B, num_agents-1)
+
+        # 使用 self.closest_agents_num 来选择最近的 N 个智能体
+        _, indices = torch.topk(distances, self.closest_agents_num, dim=-1, largest=False, sorted=False)  # (B, N)
+
+        # 修正索引计算 
+        closest_agents = torch.gather( 
+            x_encoder_agents[:, 1:],  # 源数据范围：[B, num_agents-1, D]
+            dim=1,
+            index=indices.unsqueeze(-1).expand(-1,  -1, x_encoder_agents.size(-1)) 
+        )
+        
+        return closest_agents, indices
+
+    def forward(self, data):
         hist_valid_mask = data['x_valid_mask']          
         hist_key_valid_mask = data['x_key_valid_mask']
         hist_feat = torch.cat(
@@ -144,6 +171,7 @@ class RealMotion_I(nn.Module):
                                  lane_feat.new_zeros(*lane_feat.shape[:2])], dim=1).bool()
 
         x_encoder = x_encoder + pos_embed
+
         if isinstance(self, RealMotion):
             # read memory for stream process
             if 'memory_dict' in data and data['memory_dict'] is not None:
@@ -163,30 +191,52 @@ class RealMotion_I(nn.Module):
                 memory_type_mask = x_type_mask
             cur_pose = torch.zeros_like(memory_pose)
 
-            # 场景交互，处理所有智能体的特征
-            # scene interaction
-            new_x_encoder = self.scene_interact(
-                x_encoder, 
-                memory_x_encoder, 
-                cur_pose, 
-                memory_pose, 
-                key_padding_mask=~memory_valid_mask
-            )
+            # 场景交互
+            new_x_encoder = x_encoder
             C = x_encoder.size(-1)
             # new_x_encoder = self.scene_interact(new_x_encoder, memory_x_encoder, cur_pose, memory_pose, key_padding_mask=~memory_valid_mask)
             new_actor_feat = self.scene_interact(new_x_encoder[x_type_mask].reshape(B, -1, C), memory_x_encoder, cur_pose, memory_pose, key_padding_mask=~memory_valid_mask)
             new_lane_feat = self.scene_interact(new_x_encoder[~x_type_mask].reshape(B, -1, C), memory_x_encoder[~memory_type_mask].reshape(B, -1, C), cur_pose, memory_pose, key_padding_mask=~memory_valid_mask[~memory_type_mask].reshape(B, -1))
             new_x_encoder = torch.cat([new_actor_feat, new_lane_feat], dim=1)
-            x_encoder = new_x_encoder * key_valid_mask.unsqueeze(-1) + x_encoder * ~key_valid_mask.unsqueeze(-1)
+            x_encoder = new_x_encoder * key_valid_mask.unsqueeze(-1) + x_encoder * ~key_valid_mask.unsqueeze(-1) 
 
         for blk in self.blocks:
             x_encoder = blk(x_encoder, key_padding_mask=~key_valid_mask)
         x_encoder = self.norm(x_encoder)
 
-        # 修改: 在预测之前，确保使用交互后的特征
-        x_agent = new_actor_feat[:, 0]
+        cos, sin = data['theta'].cos(), data['theta'].sin()
+        rot_mat = data['theta'].new_zeros(B, 2, 2)
+        rot_mat[:, 0, 0] = cos
+        rot_mat[:, 0, 1] = -sin
+        rot_mat[:, 1, 0] = sin
+        rot_mat[:, 1, 1] = cos
+
+        # Select the closest N agents (in this case, 3 closest agents)
+        x_encoder_agents = x_encoder[:, :N, :]  # 只取智能体部分
+        closest_agents, closest_agents_idx = self.select_closest_agents(x_encoder_agents)
+
+        x_agent = x_encoder[:, 0]
         y_hat, pi, x_mode = self.decoder(x_agent)
-        x_others = new_actor_feat[:, 1:]
+
+        # Decode the closest N agents using the same decoder as the center agent
+        x_modes_closest_agents = []  # 新增：收集最近N个智能体的x_mode
+        y_hat_closest = []  # 新增轨迹容器 
+        glo_y_hat_closest_list = []
+        for i in range(closest_agents.size(1)):
+            agent_feat = closest_agents[:, i, :]
+            y_hat_agent, pi_agent, x_mode_agent = self.decoder(agent_feat)
+           
+            glo_y_hat_closest = torch.bmm(y_hat_agent.detach().reshape(B, -1, 2), torch.inverse(rot_mat))
+            glo_y_hat_closest = glo_y_hat_closest.reshape(B, y_hat.size(1), -1, 2)
+
+            x_modes_closest_agents.append(x_mode_agent)  # 单独收集x_mode
+            y_hat_closest.append(y_hat_agent)
+            glo_y_hat_closest_list.append(glo_y_hat_closest)
+        x_modes_closest_agents = torch.stack(x_modes_closest_agents, dim=1)  
+        y_hat_closest = torch.stack(y_hat_closest,  dim=1)
+        glo_y_hat_closest_list = torch.stack(glo_y_hat_closest_list, dim=1)
+
+        x_others = x_encoder[:, 1:N]
         y_hat_others = self.dense_predictor(x_others).view(B, x_others.size(1), -1, 2)
 
         cos, sin = data['theta'].cos(), data['theta'].sin()
@@ -196,12 +246,13 @@ class RealMotion_I(nn.Module):
         rot_mat[:, 1, 0] = sin
         rot_mat[:, 1, 1] = cos
 
-
+        # 下面的x_mode才是修改的重点，现在是只有中心智能体有自己的x_mode，其余智能体没有
         if isinstance(self, RealMotion):
             # traj interaction
             if 'memory_dict' in data and data['memory_dict'] is not None:
                 memory_y_hat = data['memory_dict']['glo_y_hat']
                 memory_x_mode = data['memory_dict']['x_mode']
+
                 ori_idx = ((data['timestamp'] - data['memory_dict']['timestamp']) / 0.1).long() - 1
                 memory_traj_ori = torch.gather(memory_y_hat, 2, ori_idx.reshape(
                     B, 1, -1, 1).repeat(1, memory_y_hat.size(1), 1, memory_y_hat.size(-1)))
@@ -209,27 +260,66 @@ class RealMotion_I(nn.Module):
                                         ).reshape(B, memory_y_hat.size(1), -1, 2)
                 traj_embed = self.traj_embed(y_hat.detach().reshape(B, y_hat.size(1), -1))
                 memory_traj_embed = self.traj_embed(memory_y_hat.reshape(B, memory_y_hat.size(1), -1))
-                x_mode = self.traj_interact(x_mode, memory_x_mode, cur_pose, memory_pose,
+                x_mode = self.traj_interact_center(x_mode, memory_x_mode, cur_pose, memory_pose,
                                                     cur_pos_embed=traj_embed,
                                                     memory_pos_embed=memory_traj_embed)
-                y_hat_diff = self.stream_loc(x_mode).reshape(B, y_hat.size(1), -1, 2)
+                
+
+                 # 邻近智能体记忆交互 
+                updated_y_hat_closest = []
+                updated_x_modes = []
+                for i in range(x_modes_closest_agents.size(1)): 
+                    # 每个邻近智能体独立处理 
+                    x_mode_agent = x_modes_closest_agents[:, i]
+                    y_hat_agent = y_hat_closest[:, i]  # 新增当前轨迹
+
+                    
+                    memory_x_mode_agent = data['memory_dict']['x_mode_closest'][:, i]
+                    memory_y_hat_agent = data['memory_dict']['glo_y_hat_closest_list'][:, i]
+
+                    memory_traj_ori = torch.gather(memory_y_hat_agent, 2, ori_idx.reshape(
+                    B, 1, -1, 1).repeat(1, memory_y_hat_agent.size(1), 1, memory_y_hat_agent.size(-1)))
+                    memory_y_hat_agent = torch.bmm((memory_y_hat_agent - memory_traj_ori).reshape(B, -1, 2), rot_mat
+                                            ).reshape(B, memory_y_hat_agent.size(1), -1, 2)
+                    traj_embed = self.traj_embed(y_hat_agent.detach().reshape(B, y_hat_agent.size(1), -1))
+                    memory_traj_embed = self.traj_embed(memory_y_hat_agent.reshape(B, memory_y_hat_agent.size(1), -1))
+                    x_mode_agent = self.traj_interact_agent(x_mode_agent, memory_x_mode_agent, cur_pose, memory_pose,
+                                                        cur_pos_embed=traj_embed,
+                                                        memory_pos_embed=memory_traj_embed)
+                    
+                    x_mode = self.traj_interact_center_agent(x_mode, x_mode_agent, cur_pose, memory_pose,
+                                                    cur_pos_embed=traj_embed,
+                                                    memory_pos_embed=memory_traj_embed)
+
+                    updated_x_modes.append(x_mode_agent)
+                    updated_y_hat_closest.append(y_hat_agent)
+
+                # 合并更新后的模式 
+                x_modes_closest_agents = torch.stack(updated_x_modes,  dim=1)
+                glo_y_hat_closest_list = torch.stack(updated_y_hat_closest,  dim=1)
+
+
+
+                y_hat_diff = self.stream_loc(x_mode).reshape(B, y_hat.size(1), -1, 2)  # 只更新中心智能体
                 y_hat = y_hat + y_hat_diff
 
         ret_dict = {
             'y_hat': y_hat,
             'pi': pi,
             'y_hat_others': y_hat_others,
-            'x_mode': x_mode,  # 添加x_mode到返回字典
         }
 
         glo_y_hat = torch.bmm(y_hat.detach().reshape(B, -1, 2), torch.inverse(rot_mat))
         glo_y_hat = glo_y_hat.reshape(B, y_hat.size(1), -1, 2)
+        
 
         if isinstance(self, RealMotion):
             memory_dict = {
                 'x_encoder': x_encoder,
                 'x_mode': x_mode,
+                'x_mode_closest': x_modes_closest_agents,# 新增邻近智能体记忆存储  
                 'glo_y_hat': glo_y_hat,
+                'glo_y_hat_closest_list': glo_y_hat_closest_list, # 添加邻近智能体全局轨迹存储
                 'x_mask': key_valid_mask,
                 'x_type_mask': x_type_mask,
                 'origin': data['origin'],
@@ -243,14 +333,10 @@ class RealMotion_I(nn.Module):
 
 class RealMotion(RealMotion_I):
     def __init__(self, 
-                 max_memory_size=5,  # 最大记忆库大小
-                 adapt_memory_size=True,  # 是否启用自适应记忆大小
                  use_stream_encoder=True,
                  use_stream_decoder=True,
                  **kwargs):
         super().__init__(**kwargs)
-        self.max_memory_size = max_memory_size  # 最大智能体记忆库大小
-        self.adapt_memory_size = adapt_memory_size  # 是否启用自适应记忆大小
         self.embed_dim = kwargs['embed_dim']
         self.pose_dim = 4
         
@@ -263,7 +349,23 @@ class RealMotion(RealMotion_I):
             qkv_bias=kwargs['qkv_bias'],
         )
 
-        self.traj_interact = InteractionModule(
+        self.traj_interact_center = InteractionModule(
+            dim=kwargs['embed_dim'],
+            pose_dim=self.pose_dim,
+            num_heads=kwargs['num_heads'],
+            mlp_ratio=kwargs['mlp_ratio'],
+            qkv_bias=kwargs['qkv_bias'],
+        )
+
+        self.traj_interact_agent = InteractionModule(
+            dim=kwargs['embed_dim'],
+            pose_dim=self.pose_dim,
+            num_heads=kwargs['num_heads'],
+            mlp_ratio=kwargs['mlp_ratio'],
+            qkv_bias=kwargs['qkv_bias'],
+        )
+
+        self.traj_interact_center_agent = InteractionModule(
             dim=kwargs['embed_dim'],
             pose_dim=self.pose_dim,
             num_heads=kwargs['num_heads'],
@@ -271,6 +373,7 @@ class RealMotion(RealMotion_I):
             qkv_bias=kwargs['qkv_bias'],
         )
          
+        
     
         self.stream_loc = nn.Sequential(
             nn.Linear(kwargs['embed_dim'], 256),
@@ -284,72 +387,7 @@ class RealMotion(RealMotion_I):
             nn.GELU(),
             nn.Linear(kwargs['embed_dim'], kwargs['embed_dim']),
         )
-
-    def update_memory(self, data, x_encoder, key_valid_mask, x_type_mask):
-        """
-        更新记忆库，限制共享记忆库的大小，并动态选择重要智能体。
-        """
-        memory_dict = {
-            'x_encoder': x_encoder,
-            'x_mode': data['x_mode'],  # 当前智能体的模式
-            'glo_y_hat': data['glo_y_hat'],  # 当前智能体的预测轨迹
-            'x_mask': key_valid_mask,
-            'x_type_mask': x_type_mask,
-            'origin': data['origin'],
-            'theta': data['theta'],
-            'timestamp': data['timestamp'],
-        }
-
-        # 计算每个智能体与当前智能体的相似度（例如，基于位置、速度等）
-        if self.adapt_memory_size:
-            memory_dict = self.adaptive_memory_size(data, memory_dict)
-        
-        # 限制记忆库的大小，使用FIFO策略
-        if len(memory_dict['x_encoder']) > self.max_memory_size:
-            memory_dict = self.apply_fifo(memory_dict)
-        
-        return memory_dict
-
-    def apply_fifo(self, memory_dict):
-        """
-        应用FIFO策略，限制记忆库的大小，保留最新的max_memory_size个智能体。
-        """
-        memory_dict['x_encoder'] = memory_dict['x_encoder'][-self.max_memory_size:]  # 保留最近的max_memory_size个智能体
-        memory_dict['x_mode'] = memory_dict['x_mode'][-self.max_memory_size:]
-        memory_dict['glo_y_hat'] = memory_dict['glo_y_hat'][-self.max_memory_size:]
-        memory_dict['x_mask'] = memory_dict['x_mask'][-self.max_memory_size:]
-        memory_dict['x_type_mask'] = memory_dict['x_type_mask'][-self.max_memory_size:]
-        memory_dict['origin'] = memory_dict['origin'][-self.max_memory_size:]
-        memory_dict['theta'] = memory_dict['theta'][-self.max_memory_size:]
-        memory_dict['timestamp'] = memory_dict['timestamp'][-self.max_memory_size:]
-        return memory_dict
-
-    def adaptive_memory_size(self, data, memory_dict):
-        """
-        基于场景复杂度或智能体的密度来动态调整记忆库的大小。
-        """
-        # 这里假设场景的复杂度与当前智能体的数量成正比
-        num_agents = data['num_agents']  # 当前场景中的智能体数量
     
-        # 根据场景复杂度动态调整最大记忆库大小
-        # 如果智能体数量较多，增加记忆库大小；反之，减少记忆库大小
-        if num_agents > 5:  # 如果智能体数量较多
-          self.max_memory_size = min(self.max_memory_size + 2, 5)  # 增加记忆库大小，但不超过 max_memory_size
-
-        elif num_agents < 2:  # 如果智能体数量较少
-          self.max_memory_size = max(self.max_memory_size - 1, 2)  # 减少记忆库大小，但保持至少有 2 个记忆库容量
-        
-        return memory_dict
-
-    def retrieve_memory(self, data, memory_dict):
-        """
-        从记忆库中检索当前智能体的共享记忆。
-        """
-        memory_x_encoder = memory_dict['x_encoder']
-        memory_valid_mask = memory_dict['x_mask']
-        memory_type_mask = memory_dict['x_type_mask']
-        return memory_x_encoder, memory_valid_mask, memory_type_mask
-
     
 
         
