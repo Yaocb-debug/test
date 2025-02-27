@@ -15,9 +15,9 @@ tag: ${model.tag}-${datamodule.tag}
 output_dir: outputs/${tag}/${now:%Y%m%d-%H%M%S}
 
 
-devices: [4]
+devices: [1,2,3,4]
 batch_size: 32
-epochs: 1
+epochs: 2
 checkpoint:
 submit:
 
@@ -39,7 +39,7 @@ trainer:
   max_epochs: ${epochs}
   accelerator: gpu
   devices: ${devices}
-  strategy: ddp_find_unused_parameters_false
+  strategy: ddp_find_unused_parameters_true
   gradient_clip_val: 5
   gradient_clip_algorithm: norm
   sync_batchnorm: true

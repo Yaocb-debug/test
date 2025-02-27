@@ -23,7 +23,7 @@ class RealMotion_I(nn.Module):
         future_steps=60,
         use_transformer_decoder=False,
         num_decoder_layers=6,
-        closest_agents_num=3,
+        closest_agents_num=8,
     ) -> None:
         super().__init__()
         self.use_transformer_decoder = use_transformer_decoder
@@ -86,35 +86,54 @@ class RealMotion_I(nn.Module):
         }
         return self.load_state_dict(state_dict=state_dict, strict=False)
 
-    def select_closest_agents(self, x_encoder_agents: torch.Tensor) -> torch.Tensor:
+    def select_closest_agents(self, x_encoder_agents: torch.Tensor, hist_feat: torch.Tensor, hist_valid_mask: torch.Tensor) -> torch.Tensor:
+
         """
-        选择距离中心智能体最近的N个智能体，并返回其索引。
-
-        参数:
-            x_encoder (Tensor): 输入的智能体特征矩阵，形状为 (B, num_agents, feature_dim)。
-
-        返回:
-            Tuple[Tensor, Tensor]: 
-                - 最近的 N 个智能体的特征矩阵，形状为 (B, N, feature_dim)。
-                - 最近 N 个智能体的索引，形状为 (B, N)。
+            参数:
+                x_encoder_agents (Tensor): 输入的智能体特征矩阵，形状为 (B, num_agents, feature_dim)。
+                hist_feat (Tensor): 历史轨迹特征，形状为 (B*num_agents, L, D)。
+                hist_valid_mask (Tensor): 历史轨迹有效性掩码，形状为 (B, num_agents, L)。
         """
         # 获取 B, num_agents, feature_dim 的维度
         B, num_agents, feature_dim = x_encoder_agents.shape
+        center_agent = x_encoder_agents[:, 0, :]  # 中心智能体
+        others = x_encoder_agents[:, 1:, :]       # 其他智能体
 
-        # 假设中心智能体的特征是 x_encoder[:, 0]，即每个批次中的第一个智能体
-        center_agent = x_encoder_agents[:, 0, :]
+        #重塑hist_feat为4维
+        L, D = hist_feat.shape[1], hist_feat.shape[2]
+        hist_feat_4d = hist_feat.view(B, num_agents, L, D)  # 重塑为 (B, num_agents, L, D)
 
-        # 计算每个智能体到中心智能体的欧式距离
-        distances = torch.norm(x_encoder_agents[:, 1:, :] - center_agent[:, None, :], dim=-1)  # (B, num_agents-1)
+        # (1) 计算欧式距离
+        distances = torch.norm(others - center_agent[:, None, :], dim=-1)   # (B, num_agents-1)
 
-        # 使用 self.closest_agents_num 来选择最近的 N 个智能体
-        _, indices = torch.topk(distances, self.closest_agents_num, dim=-1, largest=False, sorted=False)  # (B, N)
+        # (2) 从hist_feat提取速度方向
+        # 取最后两个时间步的位置差分，计算方向向量
+        pos_diff = hist_feat_4d[..., -2:, :2]  # (B, num_agents, 2, 2)
+        direction = pos_diff[..., 1, :] - pos_diff[..., 0, :]  # (B, num_agents, 2)
+        center_direction = direction[:, 0, :]  # (B, 2)
+        others_direction = direction[:, 1:, :]  # (B, num_agents-1, 2)
 
-        # 修正索引计算 
-        closest_agents = torch.gather( 
-            x_encoder_agents[:, 1:],  # 源数据范围：[B, num_agents-1, D]
-            dim=1,
-            index=indices.unsqueeze(-1).expand(-1,  -1, x_encoder_agents.size(-1)) 
+        # 归一化方向向量并计算方向相似性
+        center_direction = F.normalize(center_direction, dim=-1) + 1e-8
+        others_direction = F.normalize(others_direction, dim=-1) + 1e-8
+        velocity_sim = F.cosine_similarity(others_direction, center_direction[:, None, :], dim=-1)
+
+        # (3) 计算历史轨迹相关性
+        hist_embed = self.hist_embed(hist_feat.permute(0, 2, 1).contiguous())
+        hist_embed = hist_embed.view(B, num_agents, -1)
+        center_hist_embed = hist_embed[:, 0, :]
+        others_hist_embed = hist_embed[:, 1:, :]
+        traj_sim = F.cosine_similarity(others_hist_embed, center_hist_embed[:, None, :], dim=-1)
+
+        # (4) 综合得分
+        w1, w2, w3 = 0.3, 0.5, 0.4  # 距离权重:0.3, 方向权重:0.5, 轨迹权重:0.4
+        score = w1 * distances + w2 * (1 - velocity_sim.clamp(min=0)) + w3 * (1 - traj_sim.clamp(min=0))
+        
+        # (5) 选择得分最低的N个智能体
+        _, indices = torch.topk(score, self.closest_agents_num, dim=-1, largest=False)
+        closest_agents = torch.gather(
+            others, dim=1,
+            index=indices.unsqueeze(-1).expand(-1, -1, feature_dim)
         )
         
         return closest_agents, indices
@@ -213,7 +232,7 @@ class RealMotion_I(nn.Module):
 
         # Select the closest N agents (in this case, 3 closest agents)
         x_encoder_agents = x_encoder[:, :N, :]  # 只取智能体部分
-        closest_agents, closest_agents_idx = self.select_closest_agents(x_encoder_agents)
+        closest_agents, closest_agents_idx = self.select_closest_agents(x_encoder_agents, hist_feat, hist_valid_mask)
 
         x_agent = x_encoder[:, 0]
         y_hat, pi, x_mode = self.decoder(x_agent)
@@ -239,13 +258,7 @@ class RealMotion_I(nn.Module):
         x_others = x_encoder[:, 1:N]
         y_hat_others = self.dense_predictor(x_others).view(B, x_others.size(1), -1, 2)
 
-        cos, sin = data['theta'].cos(), data['theta'].sin()
-        rot_mat = data['theta'].new_zeros(B, 2, 2)
-        rot_mat[:, 0, 0] = cos
-        rot_mat[:, 0, 1] = -sin
-        rot_mat[:, 1, 0] = sin
-        rot_mat[:, 1, 1] = cos
-
+       
         # 下面的x_mode才是修改的重点，现在是只有中心智能体有自己的x_mode，其余智能体没有
         if isinstance(self, RealMotion):
             # traj interaction
@@ -294,7 +307,7 @@ class RealMotion_I(nn.Module):
                     updated_x_modes.append(x_mode_agent)
                     updated_y_hat_closest.append(y_hat_agent)
 
-                # 合并更新后的模式 
+                # 合并更新后的模式
                 x_modes_closest_agents = torch.stack(updated_x_modes,  dim=1)
                 glo_y_hat_closest_list = torch.stack(updated_y_hat_closest,  dim=1)
 
@@ -339,6 +352,8 @@ class RealMotion(RealMotion_I):
         super().__init__(**kwargs)
         self.embed_dim = kwargs['embed_dim']
         self.pose_dim = 4
+        # self.use_stream_encoder = use_stream_encoder
+        # self.use_stream_decoder = use_stream_decoder
         
         # 初始化其他组件...
         self.scene_interact = InteractionModule(
